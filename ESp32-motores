@@ -1,1 +1,473 @@
-Este codigo servira para conectar la ESp 32 a los motores
+/*
+ * ============================================================
+ *  FutBotMX — ESP32 #1: Músculo / Control de Movimiento
+ * ============================================================
+ *  Motores  : 4× DC con driver L298N (ruedas omnidireccionales)
+ *  IMU      : MPU6050 (giroscopio + acelerómetro) via I2C
+ *  PID      : Control de orientación absoluta (heading)
+ *  Comunicación : WiFi UDP — escucha comandos de la Raspberry Pi
+ *                 y envía telemetría de regreso.
+ *
+ *  Frecuencia de control: 200 Hz (loop de 5 ms)
+ *
+ * ─── Cinemática omnidireccional (ruedas a 45°, 135°, 225°, 315°) ────────────
+ *
+ *   Las 4 ruedas están montadas en diagonal (45° respecto al frente).
+ *   Vector de movimiento (Vx, Vy) + rotación (ω):
+ *
+ *     M1 (45°)  =  Vx + Vy + ω
+ *     M2 (135°) = -Vx + Vy + ω
+ *     M3 (225°) = -Vx - Vy + ω
+ *     M4 (315°) =  Vx - Vy + ω
+ *
+ *  Comando JSON que llega de la RPi:
+ *  {
+ *    "cmd" : "MOVE",
+ *    "vx"  : 0.5,    <- componente lateral  [-1.0, 1.0]
+ *    "vy"  : 0.8,    <- componente frontal   [-1.0, 1.0]
+ *    "w"   : 0.0,    <- rotación deseada     [-1.0, 1.0]
+ *    "hdg" : 90.0    <- heading objetivo (°) — si se omite, no se usa PID
+ *  }
+ *
+ *  Telemetría JSON enviada a la RPi (cada 20 ms):
+ *  {
+ *    "id"  : 1,
+ *    "hdg" : 94.3,   <- heading actual (°)
+ *    "gx"  : 0.01,   <- gyro X (rad/s)
+ *    "gy"  : -0.02,
+ *    "gz"  : 0.15,
+ *    "goal_hdg": 90.0
+ *  }
+ * ============================================================
+ *
+ *  Librerías requeridas (Library Manager de Arduino IDE):
+ *    - MPU6050 by Electronic Cats  (o MPU6050 by jrowberg)
+ *    - ArduinoJson by Benoit Blanchon
+ *    - WiFi (incluida en el core ESP32)
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <MPU6050.h>
+
+// ─── Red ─────────────────────────────────────────────────────────────────────
+const char*    SSID        = "FutBotMX_AP";
+const char*    PASSWORD    = "futbot2024";
+const char*    RPI_IP      = "192.168.4.1";
+const uint16_t UDP_PORT_RX = 5006;   // ESP32 #1 escucha aquí
+const uint16_t UDP_PORT_TX = 5005;   // RPi escucha aquí (misma que ESP32 #2)
+
+// ─── I2C / MPU6050 ───────────────────────────────────────────────────────────
+#define I2C_SDA 21
+#define I2C_SCL 22
+MPU6050 mpu;
+
+// ─── Pines motores (L298N × 2) ───────────────────────────────────────────────
+//  Motor 1 — Frontal Derecho (45°)
+#define M1_IN1  25
+#define M1_IN2  26
+#define M1_PWM  32   // Canal LEDC 0
+
+//  Motor 2 — Frontal Izquierdo (135°)
+#define M2_IN1  27
+#define M2_IN2  14
+#define M2_PWM  33   // Canal LEDC 1
+
+//  Motor 3 — Trasero Izquierdo (225°)
+#define M3_IN1  12
+#define M3_IN2  13
+#define M3_PWM  15   // Canal LEDC 2
+
+//  Motor 4 — Trasero Derecho (315°)
+#define M4_IN1   2
+#define M4_IN2   4
+#define M4_PWM  16   // Canal LEDC 3
+
+// ─── PWM de motores (LEDC) ───────────────────────────────────────────────────
+const int PWM_FREQ     = 20000;   // 20 kHz, inaudible y eficiente para L298N
+const int PWM_BITS     = 8;       // Resolución 0-255
+const int MAX_PWM      = 255;
+const int MIN_PWM_MOVE = 60;      // PWM mínimo para vencer inercia estática
+
+// ─── Constantes PID de orientación ───────────────────────────────────────────
+//  Ajusta KP, KI, KD tras pruebas físicas con el robot.
+//  Punto de partida conservador para evitar oscilaciones.
+float KP = 2.8f;
+float KI = 0.05f;
+float KD = 0.35f;
+
+float pidIntegral   = 0.0f;
+float pidErrorPrev  = 0.0f;
+float headingActual = 0.0f;   // grados, integrado del giroscopio
+float headingGoal   = 0.0f;   // objetivo enviado por la RPi
+bool  pidActivo     = false;  // false = la RPi manda ω directo
+
+// ─── Portería contraria ───────────────────────────────────────────────────────
+//  La Raspberry Pi conoce la posición global. Aquí almacenamos
+//  el ángulo (heading) que apunta hacia la portería rival, para
+//  que el PID alinee el robot en esa dirección al atacar.
+float headingPorteria = 0.0f;   // se recibe de la RPi en el campo "goal_dir"
+
+// ─── Variables de comando ─────────────────────────────────────────────────────
+float cmdVx = 0.0f;
+float cmdVy = 0.0f;
+float cmdW  = 0.0f;
+
+// ─── Tiempo ───────────────────────────────────────────────────────────────────
+uint32_t ultimoLoop     = 0;
+uint32_t ultimoTelemetry= 0;
+const uint32_t DT_US    = 5000;   // 5 ms = 200 Hz
+float    dt             = 0.005f; // delta time en segundos
+
+WiFiUdp udp;
+
+// ─── Integración heading ──────────────────────────────────────────────────────
+/*
+ * El MPU6050 provee velocidad angular (°/s) en el eje Z (gz).
+ * Integramos gz * dt para obtener el heading absoluto.
+ * Bias de offset: se calibra en setup() promediando 500 lecturas en reposo.
+ */
+float gzOffset = 0.0f;
+
+// =============================================================================
+//  FUNCIONES DE MOTOR
+// =============================================================================
+
+void configurarMotores() {
+  // Configura los 4 canales LEDC y sus pines de dirección
+  ledcSetup(0, PWM_FREQ, PWM_BITS);
+  ledcSetup(1, PWM_FREQ, PWM_BITS);
+  ledcSetup(2, PWM_FREQ, PWM_BITS);
+  ledcSetup(3, PWM_FREQ, PWM_BITS);
+
+  ledcAttachPin(M1_PWM, 0);
+  ledcAttachPin(M2_PWM, 1);
+  ledcAttachPin(M3_PWM, 2);
+  ledcAttachPin(M4_PWM, 3);
+
+  int dirPins[] = {M1_IN1, M1_IN2, M2_IN1, M2_IN2,
+                   M3_IN1, M3_IN2, M4_IN1, M4_IN2};
+  for (int p : dirPins) pinMode(p, OUTPUT);
+}
+
+// Aplica PWM y dirección a un motor individual.
+// pwm: -255 (reversa máxima) a +255 (adelante máximo)
+void escribirMotor(int canal, int in1, int in2, int pwm) {
+  pwm = constrain(pwm, -MAX_PWM, MAX_PWM);
+  if (pwm > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    ledcWrite(canal, pwm);
+  } else if (pwm < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    ledcWrite(canal, -pwm);
+  } else {
+    // Freno activo (ambas entradas HIGH = cortocircuito en L298N)
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, HIGH);
+    ledcWrite(canal, 0);
+  }
+}
+
+// Detiene todos los motores inmediatamente
+void detenerMotores() {
+  escribirMotor(0, M1_IN1, M1_IN2, 0);
+  escribirMotor(1, M2_IN1, M2_IN2, 0);
+  escribirMotor(2, M3_IN1, M3_IN2, 0);
+  escribirMotor(3, M4_IN1, M4_IN2, 0);
+}
+
+// =============================================================================
+//  CINEMÁTICA OMNIDIRECCIONAL
+// =============================================================================
+/*
+ * Convierte el vector de movimiento (vx, vy, w) a velocidades
+ * individuales de motor y las aplica.
+ *
+ * vx, vy : componentes del vector de traslación [-1.0, 1.0]
+ * w      : componente de rotación [-1.0, 1.0]
+ *           positivo = giro antihorario visto desde arriba
+ */
+void moverOmnidireccional(float vx, float vy, float w) {
+  // Mezcla cinemática para ruedas a 45°/135°/225°/315°
+  float m1 =  vx + vy + w;   // Frontal Derecho
+  float m2 = -vx + vy + w;   // Frontal Izquierdo
+  float m3 = -vx - vy + w;   // Trasero Izquierdo
+  float m4 =  vx - vy + w;   // Trasero Derecho
+
+  // Normalización: si algún valor supera 1.0, escala todo
+  float maxVal = max({fabsf(m1), fabsf(m2), fabsf(m3), fabsf(m4), 1.0f});
+  m1 /= maxVal;
+  m2 /= maxVal;
+  m3 /= maxVal;
+  m4 /= maxVal;
+
+  // Convierte a PWM entero
+  int pwm1 = (int)(m1 * MAX_PWM);
+  int pwm2 = (int)(m2 * MAX_PWM);
+  int pwm3 = (int)(m3 * MAX_PWM);
+  int pwm4 = (int)(m4 * MAX_PWM);
+
+  // Umbral mínimo de movimiento (vence la inercia estática)
+  auto aplicarUmbral = [](int pwm) -> int {
+    if (pwm > 0  && pwm < MIN_PWM_MOVE) return MIN_PWM_MOVE;
+    if (pwm < 0  && pwm > -MIN_PWM_MOVE) return -MIN_PWM_MOVE;
+    return pwm;
+  };
+
+  escribirMotor(0, M1_IN1, M1_IN2, aplicarUmbral(pwm1));
+  escribirMotor(1, M2_IN1, M2_IN2, aplicarUmbral(pwm2));
+  escribirMotor(2, M3_IN1, M3_IN2, aplicarUmbral(pwm3));
+  escribirMotor(3, M4_IN1, M4_IN2, aplicarUmbral(pwm4));
+}
+
+// =============================================================================
+//  MPU6050 — CALIBRACIÓN Y LECTURA
+// =============================================================================
+
+void calibrarGiroscopio() {
+  /*
+   * Promedia 500 lecturas de gz con el robot en reposo para calcular
+   * el offset de bias. Duración aprox: 500 × 3 ms = 1.5 s.
+   * El robot DEBE estar completamente inmóvil durante este proceso.
+   */
+  Serial.println("Calibrando giroscopio (mantén el robot inmóvil)...");
+  long suma = 0;
+  const int N = 500;
+  for (int i = 0; i < N; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    suma += gz;
+    delay(3);
+  }
+  gzOffset = (float)suma / N;
+  Serial.printf("✓ Offset gz = %.2f LSB\n", gzOffset);
+}
+
+float leerGZ_dps() {
+  /*
+   * Devuelve la velocidad angular en eje Z en grados/segundo,
+   * ya con el bias corregido y convertido a unidades físicas.
+   * Sensibilidad MPU6050 en rango ±250°/s → 131 LSB/°/s
+   */
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  return ((float)gz - gzOffset) / 131.0f;
+}
+
+// =============================================================================
+//  PID DE ORIENTACIÓN
+// =============================================================================
+/*
+ * Calcula la corrección de rotación (ω) para mantener el heading objetivo.
+ * El error está en el espacio angular [-180, 180] para evitar wrap-around.
+ * Retorna un valor en [-1.0, 1.0] que se suma a la cinemática como componente w.
+ */
+float calcularPID(float setpoint, float medicion, float dtSeg) {
+  // Error angular normalizado a [-180°, 180°]
+  float error = setpoint - medicion;
+  while (error >  180.0f) error -= 360.0f;
+  while (error < -180.0f) error += 360.0f;
+
+  // Anti-windup: limita la integral
+  pidIntegral += error * dtSeg;
+  pidIntegral  = constrain(pidIntegral, -50.0f, 50.0f);
+
+  float derivada = (error - pidErrorPrev) / dtSeg;
+  pidErrorPrev   = error;
+
+  float salida = KP * error + KI * pidIntegral + KD * derivada;
+
+  // Normaliza la salida a [-1, 1] (asumiendo que error máximo relevante ≈ 180°)
+  return constrain(salida / 180.0f, -1.0f, 1.0f);
+}
+
+// =============================================================================
+//  COMUNICACIÓN WiFi / UDP
+// =============================================================================
+
+void conectarWiFi() {
+  Serial.printf("Conectando a %s", SSID);
+  WiFi.begin(SSID, PASSWORD);
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 40) {
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✓ IP asignada: %s\n", WiFi.localIP().toString().c_str());
+    udp.begin(UDP_PORT_RX);
+  } else {
+    Serial.println("\n✗ Sin WiFi — modo autónomo activado");
+  }
+}
+
+/*
+ * Procesa un paquete UDP entrante de la Raspberry Pi.
+ * Formato esperado (JSON):
+ * {
+ *   "cmd"      : "MOVE",   // "MOVE" | "STOP" | "PID_ON" | "PID_OFF" | "TUNE"
+ *   "vx"       : 0.5,
+ *   "vy"       : 0.8,
+ *   "w"        : 0.0,
+ *   "hdg"      : 90.0,     // heading objetivo (solo si PID activo)
+ *   "goal_dir" : 45.0,     // dirección de la portería rival (actualiza headingPorteria)
+ *   "kp"       : 2.8,      // sintonización online del PID (cmd="TUNE")
+ *   "ki"       : 0.05,
+ *   "kd"       : 0.35
+ * }
+ */
+void procesarComando(const char* json) {
+  StaticJsonDocument<200> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.printf("[UDP] JSON inválido: %s\n", err.c_str());
+    return;
+  }
+
+  const char* cmd = doc["cmd"] | "MOVE";
+
+  if (strcmp(cmd, "STOP") == 0) {
+    cmdVx = cmdVy = cmdW = 0.0f;
+    detenerMotores();
+    return;
+  }
+
+  if (strcmp(cmd, "PID_ON") == 0)  { pidActivo = true;  return; }
+  if (strcmp(cmd, "PID_OFF") == 0) { pidActivo = false; pidIntegral = 0; return; }
+
+  if (strcmp(cmd, "TUNE") == 0) {
+    KP = doc["kp"] | KP;
+    KI = doc["ki"] | KI;
+    KD = doc["kd"] | KD;
+    pidIntegral = 0;   // resetea integrador al cambiar ganancias
+    Serial.printf("[PID] Resintonizado KP=%.3f KI=%.4f KD=%.3f\n", KP, KI, KD);
+    return;
+  }
+
+  // CMD = "MOVE" (default)
+  cmdVx = doc["vx"] | 0.0f;
+  cmdVy = doc["vy"] | 0.0f;
+  cmdW  = doc["w"]  | 0.0f;
+
+  // Heading objetivo para el PID
+  if (doc.containsKey("hdg")) {
+    headingGoal = doc["hdg"];
+    pidActivo   = true;
+  }
+
+  // Actualiza la dirección de la portería rival (para lógica de ataque en RPi)
+  if (doc.containsKey("goal_dir")) {
+    headingPorteria = doc["goal_dir"];
+  }
+}
+
+void recibirComandos() {
+  int tam = udp.parsePacket();
+  if (tam <= 0) return;
+  char buf[256];
+  int leidos = udp.read(buf, sizeof(buf) - 1);
+  buf[leidos] = '\0';
+  procesarComando(buf);
+}
+
+void enviarTelemetria() {
+  StaticJsonDocument<192> doc;
+  doc["id"]       = 1;
+  doc["hdg"]      = headingActual;
+  doc["goal_hdg"] = headingGoal;
+  doc["porteria"] = headingPorteria;
+  doc["pid_on"]   = pidActivo;
+
+  char buf[192];
+  size_t len = serializeJson(doc, buf);
+  udp.beginPacket(RPI_IP, UDP_PORT_TX);
+  udp.write((uint8_t*)buf, len);
+  udp.endPacket();
+}
+
+// =============================================================================
+//  SETUP
+// =============================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("FutBotMX — ESP32 #1 Músculo iniciando...");
+
+  // I2C para el MPU6050
+  Wire.begin(I2C_SDA, I2C_SCL);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("✗ MPU6050 no detectado — verifica el cableado SDA/SCL");
+  } else {
+    Serial.println("✓ MPU6050 OK");
+    // Configura rango del giroscopio a ±250°/s (máxima sensibilidad)
+    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+    // Configura rango del acelerómetro a ±2g
+    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+    // Filtro paso-bajo a 42 Hz (reduce vibración de los motores DC)
+    mpu.setDLPFMode(MPU6050_DLPF_BW_42);
+    calibrarGiroscopio();
+  }
+
+  configurarMotores();
+  detenerMotores();
+  conectarWiFi();
+
+  ultimoLoop = micros();
+  Serial.println("Sistema listo. Esperando comandos de la Raspberry Pi...");
+}
+
+// =============================================================================
+//  LOOP PRINCIPAL — 200 Hz
+// =============================================================================
+void loop() {
+  uint32_t ahora = micros();
+  if (ahora - ultimoLoop < DT_US) return;   // Espera hasta completar 5 ms
+  dt          = (ahora - ultimoLoop) / 1e6f;
+  ultimoLoop  = ahora;
+
+  // ── 1. Recibe comandos UDP ─────────────────────────────────────────────────
+  recibirComandos();
+
+  // ── 2. Lee MPU6050 e integra heading ──────────────────────────────────────
+  float gz_dps     = leerGZ_dps();
+  headingActual   += gz_dps * dt;
+
+  // Normaliza heading a [0°, 360°)
+  if (headingActual >= 360.0f) headingActual -= 360.0f;
+  if (headingActual <    0.0f) headingActual += 360.0f;
+
+  // ── 3. PID de orientación (si está activo) ────────────────────────────────
+  float wEfectivo = cmdW;
+  if (pidActivo) {
+    wEfectivo = calcularPID(headingGoal, headingActual, dt);
+  }
+
+  // ── 4. Aplica cinemática omnidireccional ───────────────────────────────────
+  moverOmnidireccional(cmdVx, cmdVy, wEfectivo);
+
+  // ── 5. Telemetría hacia la RPi (50 Hz = cada 20 ms) ───────────────────────
+  if (millis() - ultimoTelemetry >= 20) {
+    ultimoTelemetry = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      enviarTelemetria();
+    }
+    Serial.printf("Hdg: %6.1f° | Goal: %6.1f° | gz: %+5.2f°/s | w: %+.2f\n",
+                  headingActual, headingGoal, gz_dps, wEfectivo);
+  }
+
+  // ── 6. Reconexión WiFi ────────────────────────────────────────────────────
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t ultimoIntento = 0;
+    if (millis() - ultimoIntento > 5000) {
+      ultimoIntento = millis();
+      WiFi.reconnect();
+    }
+  }
+}
+
