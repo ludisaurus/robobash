@@ -1,1 +1,201 @@
-ESTE codigo es para eso
+/*
+ * ============================================================
+ *  FutBotMX — ESP32 #2: Módulo de Percepción Secundaria
+ *  Basado en: Cinturon-IR.ino (TSSP58038 + CD74HC4067)
+ * ============================================================
+ *  Sensores : 16× TSSP58038 via multiplexor CD74HC4067
+ *  Comunicación : WiFi UDP → Raspberry Pi (puerto 5005)
+ *  Frecuencia de barrido : ~200 Hz (sin delay bloqueante)
+ *
+ *  Protocolo JSON enviado a la RPi:
+ *  {
+ *    "id"  : 2,           <- identificador de esta ESP32
+ *    "ir"  : 112.5,       <- ángulo del balón (-1 = no detectado)
+ *    "cnt" : 3,           <- cuántos sensores activos (para estimar distancia)
+ *    "raw" : "0100010..." <- máscara binaria de 16 bits (debug)
+ *  }
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>   // Instala: ArduinoJson by Benoit Blanchon
+
+// ─── Credenciales de red ──────────────────────────────────────────────────────
+const char* SSID        = "FutBotMX_AP";   // SSID del Access Point (RPi o router)
+const char* PASSWORD    = "futbot2024";
+const char* RPI_IP      = "192.168.4.1";   // IP fija de la Raspberry Pi
+const uint16_t UDP_PORT = 5005;            // Puerto de escucha en la RPi
+
+// ─── Pines Multiplexor CD74HC4067 ────────────────────────────────────────────
+//   Mantenemos los pines originales de Cinturon-IR.ino
+const int pinS0  = 19;
+const int pinS1  = 18;
+const int pinS2  = 5;
+const int pinS3  = 22;
+const int pinSIG = 23;   // digital INPUT (TSSP58038 = LOW activo con señal IR)
+
+// ─── Configuración de sensores ────────────────────────────────────────────────
+const int    TOTAL_SENSORES  = 16;
+const float  GRADOS_POR_SEC  = 360.0f / TOTAL_SENSORES;   // 22.5°
+const uint32_t INTERVALO_MS  = 5;   // barrido cada 5 ms → ~200 Hz
+
+// ─── Variables globales ───────────────────────────────────────────────────────
+WiFiUdp udp;
+uint32_t ultimoEnvio   = 0;
+uint32_t ultimoBarrido = 0;
+
+// Resultados del último barrido
+float   anguloBalon  = -1.0f;   // -1 = sin señal
+int     sensoresActivos = 0;
+uint16_t mascaraRaw  = 0;       // bit N = sensor N activo
+
+// ─────────────────────────────────────────────────────────────────────────────
+void seleccionarCanal(int canal) {
+  // Escribe los 4 bits de selección del mux
+  digitalWrite(pinS0, bitRead(canal, 0));
+  digitalWrite(pinS1, bitRead(canal, 1));
+  digitalWrite(pinS2, bitRead(canal, 2));
+  digitalWrite(pinS3, bitRead(canal, 3));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void barrerAnilloIR() {
+  /*
+   * Barrido de los 16 sensores IR.
+   * Estrategia de ángulo:
+   *   - Si sólo 1 sensor activo → ángulo directo.
+   *   - Si varios contiguos activos → promedio vectorial para sub-resolución.
+   *     (el balón está entre dos sectores → interpola el centro de energía)
+   */
+  mascaraRaw      = 0;
+  sensoresActivos = 0;
+
+  float sinSum = 0.0f;
+  float cosSum = 0.0f;
+
+  for (int i = 0; i < TOTAL_SENSORES; i++) {
+    seleccionarCanal(i);
+    delayMicroseconds(100);   // estabilización eléctrica del mux (original)
+
+    if (digitalRead(pinSIG) == LOW) {   // LOW = señal IR presente (TSSP58038)
+      mascaraRaw |= (1 << i);
+      sensoresActivos++;
+
+      // Acumula el vector unitario hacia ese sector
+      float rad = (i * GRADOS_POR_SEC) * DEG_TO_RAD;
+      sinSum += sinf(rad);
+      cosSum += cosf(rad);
+    }
+  }
+
+  if (sensoresActivos > 0) {
+    // atan2 del promedio vectorial → ángulo interpolado en [-180, 180]
+    float angRad = atan2f(sinSum, cosSum);
+    anguloBalon  = angRad * RAD_TO_DEG;
+    if (anguloBalon < 0) anguloBalon += 360.0f;   // normaliza a [0, 360)
+  } else {
+    anguloBalon = -1.0f;   // sin señal
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void enviarDatosRPi() {
+  /*
+   * Empaqueta los resultados en JSON y los envía por UDP a la Raspberry Pi.
+   * Tamaño del buffer: 128 bytes es suficiente para este payload.
+   */
+  StaticJsonDocument<128> doc;
+  doc["id"]  = 2;
+  doc["ir"]  = (sensoresActivos > 0) ? anguloBalon : -1.0f;
+  doc["cnt"] = sensoresActivos;
+
+  // Máscara de 16 bits como string binario (útil para debug en la RPi)
+  char rawBits[17];
+  for (int i = 0; i < 16; i++) {
+    rawBits[i] = bitRead(mascaraRaw, i) ? '1' : '0';
+  }
+  rawBits[16] = '\0';
+  doc["raw"] = rawBits;
+
+  char buffer[128];
+  size_t len = serializeJson(doc, buffer);
+
+  udp.beginPacket(RPI_IP, UDP_PORT);
+  udp.write((uint8_t*)buffer, len);
+  udp.endPacket();
+
+  // Debug local
+  Serial.print("[UDP→RPi] ");
+  Serial.println(buffer);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void conectarWiFi() {
+  Serial.printf("Conectando a %s", SSID);
+  WiFi.begin(SSID, PASSWORD);
+
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 30) {
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✓ WiFi conectado | IP: %s\n", WiFi.localIP().toString().c_str());
+    udp.begin(UDP_PORT);
+  } else {
+    Serial.println("\n✗ Sin WiFi — operando en modo local (solo Serial)");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("FutBotMX — ESP32 #2 Percepción IR iniciando...");
+
+  // Pines del multiplexor
+  pinMode(pinS0,  OUTPUT);
+  pinMode(pinS1,  OUTPUT);
+  pinMode(pinS2,  OUTPUT);
+  pinMode(pinS3,  OUTPUT);
+  pinMode(pinSIG, INPUT_PULLUP);
+
+  conectarWiFi();
+  Serial.println("Anillo IR (16ch TSSP58038) listo. Barriendo a ~200Hz");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  uint32_t ahora = millis();
+
+  // 1 — Barrido IR no bloqueante cada 5 ms (~200 Hz)
+  if (ahora - ultimoBarrido >= INTERVALO_MS) {
+    ultimoBarrido = ahora;
+    barrerAnilloIR();
+  }
+
+  // 2 — Envío UDP a la RPi cada 20 ms (50 Hz es suficiente para la FSM)
+  if (ahora - ultimoEnvio >= 20) {
+    ultimoEnvio = ahora;
+    if (WiFi.status() == WL_CONNECTED) {
+      enviarDatosRPi();
+    }
+    // También imprime en Serial para debug sin WiFi
+    Serial.printf("IR: %.1f° | activos: %d\n",
+                  anguloBalon, sensoresActivos);
+  }
+
+  // 3 — Reconexión automática si se pierde el WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t ultimoIntento = 0;
+    if (ahora - ultimoIntento > 5000) {
+      ultimoIntento = ahora;
+      Serial.println("[WiFi] Reconectando...");
+      WiFi.reconnect();
+    }
+  }
+}
+
