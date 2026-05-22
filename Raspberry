@@ -1,1 +1,42 @@
+import socket
+import json
+import time
 
+# Configuración del ESP32 (Asegúrate de que esta sea la IP fija de tu ESP32)
+ESP32_IP = "192.168.1.50" 
+UDP_PORT = 5005
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def enviar_comando(vx, vy, w):
+    comando = {
+        "cmd": "MOVE",
+        "vx": vx,
+        "vy": vy,
+        "w": w
+    }
+    mensaje = json.dumps(comando)
+    sock.sendto(mensaje.encode(), (ESP32_IP, UDP_PORT))
+
+# Ejemplo de Árbol de Decisiones (FSM sencilla)
+def arbol_decisiones(balon_detectado, cerca):
+    if not balon_detectado:
+        # Estado: Buscar balón (girar en el sitio)
+        return 0.0, 0.0, 0.5 
+    elif cerca:
+        # Estado: Atacar (moverse hacia adelante)
+        return 0.0, 0.8, 0.0
+    else:
+        # Estado: Acercarse lentamente
+        return 0.0, 0.3, 0.0
+
+# Bucle principal
+while True:
+    # Simulación de datos recibidos (esto vendría de tu visión artificial)
+    balon = True 
+    esta_cerca = False
+    
+    vx, vy, w = arbol_decisiones(balon, esta_cerca)
+    enviar_comando(vx, vy, w)
+    
+    time.sleep(0.05) # 20 Hz de actualización
