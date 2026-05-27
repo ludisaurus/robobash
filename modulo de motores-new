@@ -1,170 +1,46 @@
-Implementar llantas omnidireccionales (como las ruedas Mecanum) es un excelente proyecto. La magia de este tipo de tracción no está en la mecánica, sino en la **combinación de giros** de cada motor. Para desplazarte lateralmente (hacer "strafing") sin que el robot rote, necesitas que las ruedas giren en direcciones opuestas en un patrón específico.
-Aquí tienes el código completo. He creado una función universal llamada controlarMotor para simplificar la lógica y agregué funciones específicas para cada tipo de movimiento (adelante, atrás, izquierda, derecha y giros).
-### Suposición de cableado (¡Muy importante!)
-Para que la matemática de los movimientos omnidireccionales funcione, este código asume la siguiente configuración en tu chasis:
- * **Motor 1:** Frontal Izquierdo (M1 en el Shield)
- * **Motor 2:** Frontal Derecho (M2 en el Shield)
- * **Motor 3:** Trasero Izquierdo (M3 en el Shield)
- * **Motor 4:** Trasero Derecho (M4 en el Shield)
-### Código para Chasis Omnidireccional con ESP32
-```cpp
-/* * Control de Robot Omnidireccional (Mecanum) con L293D y ESP32
- */
+// Definición de pines para el Motor A
+const int pinPWM = 16;  // Pin de velocidad (PWM)
+const int pinIN1 = 17;  // Pin de dirección 1
+const int pinIN2 = 18;  // Pin de dirección 2
+const int pinSTBY = 19; // Pin de habilitación (Standby)
 
-// 1. Pines del Shift Register (74HC595) conectados al ESP32
-const int DIR_CLK = 14;   
-const int DIR_EN = 27;    
-const int DIR_SER = 26;   
-const int DIR_LATCH = 25; 
-
-// 2. Pines PWM para la velocidad de los motores
-const int PWM_M1 = 32; // Frontal Izquierdo
-const int PWM_M2 = 33; // Frontal Derecho
-const int PWM_M3 = 22; // Trasero Izquierdo
-const int PWM_M4 = 23; // Trasero Derecho
-
-// Variable global para el estado de dirección
-byte shiftRegisterData = 0;
+// Configuración de PWM
+const int frecuencia = 16000; // 16 kHz para evitar ruido
+const int canalPWM = 0;       // Canal LEDC a usar
+const int resolucion = 8;     // 8 bits (0-255)
 
 void setup() {
-  Serial.begin(115200);
-
-  // Configurar pines de dirección
-  pinMode(DIR_CLK, OUTPUT);
-  pinMode(DIR_EN, OUTPUT);
-  pinMode(DIR_SER, OUTPUT);
-  pinMode(DIR_LATCH, OUTPUT);
-
-  // Configurar pines PWM
-  pinMode(PWM_M1, OUTPUT);
-  pinMode(PWM_M2, OUTPUT);
-  pinMode(PWM_M3, OUTPUT);
-  pinMode(PWM_M4, OUTPUT);
-
-  // Habilitar el Shift Register y apagar motores
-  digitalWrite(DIR_EN, LOW);
-  actualizarShiftRegister(0);
+  pinMode(pinIN1, OUTPUT);
+  pinMode(pinIN2, OUTPUT);
+  pinMode(pinSTBY, OUTPUT);
   
-  Serial.println("Sistema Omnidireccional Iniciado");
+  // Configuración del canal PWM
+  ledcAttachChannel(pinPWM, frecuencia, resolucion, canalPWM);
+  
+  // Activar el driver (Sacarlo del modo Standby)
+  digitalWrite(pinSTBY, HIGH);
+}
+
+// Función para mover el motor
+void moverMotor(int velocidad) {
+  if (velocidad > 0) {
+    digitalWrite(pinIN1, HIGH);
+    digitalWrite(pinIN2, LOW);
+    ledcWrite(pinPWM, velocidad);
+  } else if (velocidad < 0) {
+    digitalWrite(pinIN1, LOW);
+    digitalWrite(pinIN2, HIGH);
+    ledcWrite(pinPWM, abs(velocidad));
+  } else {
+    digitalWrite(pinIN1, LOW);
+    digitalWrite(pinIN2, LOW);
+    ledcWrite(pinPWM, 0);
+  }
 }
 
 void loop() {
-  int velocidad = 200; // Velocidad de 0 a 255
-
-  Serial.println("Adelante");
-  moverAdelante(velocidad);
+  moverMotor(200); // Gira a velocidad 200 hacia un lado
   delay(2000);
-
-  Serial.println("Desplazamiento Lateral Derecha");
-  desplazarDerecha(velocidad);
+  moverMotor(-200); // Gira a velocidad 200 hacia el otro
   delay(2000);
-
-  Serial.println("Atras");
-  moverAtras(velocidad);
-  delay(2000);
-
-  Serial.println("Desplazamiento Lateral Izquierda");
-  desplazarIzquierda(velocidad);
-  delay(2000);
-
-  Serial.println("Rotar en su propio eje (Derecha)");
-  rotarDerecha(velocidad);
-  delay(2000);
-
-  Serial.println("Freno total");
-  detenerRobot();
-  delay(3000);
 }
-
-/* --- FUNCIONES DE MOVIMIENTO OMNIDIRECCIONAL --- */
-
-void moverAdelante(int vel) {
-  controlarMotor(1, 1, vel);
-  controlarMotor(2, 1, vel);
-  controlarMotor(3, 1, vel);
-  controlarMotor(4, 1, vel);
-}
-
-void moverAtras(int vel) {
-  controlarMotor(1, -1, vel);
-  controlarMotor(2, -1, vel);
-  controlarMotor(3, -1, vel);
-  controlarMotor(4, -1, vel);
-}
-
-// La magia de las llantas Mecanum: Movimiento lateral
-void desplazarDerecha(int vel) {
-  controlarMotor(1, 1, vel);  // Frontal Izq Adelante
-  controlarMotor(2, -1, vel); // Frontal Der Atrás
-  controlarMotor(3, -1, vel); // Trasero Izq Atrás
-  controlarMotor(4, 1, vel);  // Trasero Der Adelante
-}
-
-void desplazarIzquierda(int vel) {
-  controlarMotor(1, -1, vel); // Frontal Izq Atrás
-  controlarMotor(2, 1, vel);  // Frontal Der Adelante
-  controlarMotor(3, 1, vel);  // Trasero Izq Adelante
-  controlarMotor(4, -1, vel); // Trasero Der Atrás
-}
-
-void rotarDerecha(int vel) {
-  controlarMotor(1, 1, vel);  // Lado Izq Adelante
-  controlarMotor(3, 1, vel);
-  controlarMotor(2, -1, vel); // Lado Der Atrás
-  controlarMotor(4, -1, vel);
-}
-
-void rotarIzquierda(int vel) {
-  controlarMotor(1, -1, vel); // Lado Izq Atrás
-  controlarMotor(3, -1, vel);
-  controlarMotor(2, 1, vel);  // Lado Der Adelante
-  controlarMotor(4, 1, vel);
-}
-
-void detenerRobot() {
-  controlarMotor(1, 0, 0);
-  controlarMotor(2, 0, 0);
-  controlarMotor(3, 0, 0);
-  controlarMotor(4, 0, 0);
-}
-
-/* --- LÓGICA DE CONTROL DEL SHIFT REGISTER --- */
-
-// motor: 1, 2, 3 o 4
-// direccion: 1 (Adelante), -1 (Atras), 0 (Freno)
-void controlarMotor(int motor, int direccion, int velocidad) {
-  int bitA, bitB, pinPWM;
-
-  // Asignar los bits correspondientes del 74HC595 y el pin PWM
-  if (motor == 1) { bitA = 2; bitB = 3; pinPWM = PWM_M1; }
-  else if (motor == 2) { bitA = 1; bitB = 4; pinPWM = PWM_M2; }
-  else if (motor == 3) { bitA = 5; bitB = 7; pinPWM = PWM_M3; }
-  else if (motor == 4) { bitA = 0; bitB = 6; pinPWM = PWM_M4; }
-  else return; // Motor inválido
-
-  // Establecer dirección
-  if (direccion == 1) {
-    bitSet(shiftRegisterData, bitA);
-    bitClear(shiftRegisterData, bitB);
-  } else if (direccion == -1) {
-    bitClear(shiftRegisterData, bitA);
-    bitSet(shiftRegisterData, bitB);
-  } else {
-    bitClear(shiftRegisterData, bitA);
-    bitClear(shiftRegisterData, bitB);
-  }
-
-  actualizarShiftRegister(shiftRegisterData);
-  analogWrite(pinPWM, velocidad);
-}
-
-void actualizarShiftRegister(byte data) {
-  digitalWrite(DIR_LATCH, LOW);
-  shiftOut(DIR_SER, DIR_CLK, MSBFIRST, data);
-  digitalWrite(DIR_LATCH, HIGH);
-}
-
-```
-### Solución de problemas comunes (Troubleshooting)
- 1. **Gira sobre su propio eje en lugar de moverse de lado:** Esto es muy común. Ocurre si conectaste un motor al revés (polaridad invertida) o si la rueda Mecanum de ese lado está colocada al revés (los rodillos de las llantas deben formar una "X" si ves el robot desde arriba o desde abajo).
- 2. **Se mueve en diagonal cuando quieres ir de lado:** Revisa la polaridad de los motores. Si le pides al robot ir "Adelante" y notas que una llanta va hacia atrás, simplemente invierte los dos cables de ese motor específico en las borneras azules del shield. No necesitas reprogramar nada, solo voltear los cables.
