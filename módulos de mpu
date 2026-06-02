@@ -1,0 +1,80 @@
+#include <Wire.h>
+
+const int MPU_addr = 0x68; // Dirección I2C por defecto del MPU6050
+int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
+
+void setup() {
+  Wire.begin();
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x6B); // Registro de gestión de energía
+  Wire.write(0);    // Despierta el MPU6050 (por defecto viene dormido)
+  Wire.endTransmission(true);
+  
+  Serial.begin(9600);
+}
+
+void loop() {
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x3B); // Empezar a leer desde el registro de datos del acelerómetro (AcX)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_addr, 14, true); // Pedir 14 registros en total
+  
+  // Leer datos del Acelerómetro (Ejes X, Y, Z)
+  AcX = Wire.read() << 8 | Wire.read();  
+  AcY = Wire.read() << 8 | Wire.read();  
+  AcZ = Wire.read() << 8 | Wire.read();  
+  
+  // Leer Temperatura
+  Tmp = Wire.read() << 8 | Wire.read();  
+  
+  // Leer datos del Giroscopio (Ejes X, Y, Z)
+  GyX = Wire.read() << 8 | Wire.read();  
+  GyY = Wire.read() << 8 | Wire.read();  
+  GyZ = Wire.read() << 8 | Wire.read();  
+  
+  // Imprimir valores en el Monitor Serie
+  Serial.print("Acelerometro: X="); Serial.print(AcX);
+  Serial.print(" | Y="); Serial.print(AcY);
+  Serial.print(" | Z="); Serial.println(AcZ);
+  
+  Serial.print("Giroscopio: X="); Serial.print(GyX);
+  Serial.print(" | Y="); Serial.print(GyY);
+  Serial.print(" | Z="); Serial.println(GyZ);
+  
+  Serial.print("Temperatura: "); Serial.print(Tmp / 340.00 + 36.53); // Ecuación de la hoja de datos
+  Serial.println(" C\n-----------------------------------------");
+  
+  delay(500); // Pausa para no saturar la pantalla
+}
+
+
+
+
+
+
+const int intPin = 2; // Pin digital 2 en Arduino soporta interrupciones externas
+volatile bool datosListos = false;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(intPin, INPUT);
+  
+  // Configuramos el MPU6050 para que active el pin INT cuando haya datos (requiere configurar registros específicos del sensor)
+  // ... (configuración interna del sensor) ...
+
+  // Indicamos al Arduino que cuando el pin 2 pase de BAJO a ALTO (RISING), ejecute la función 'miInterrupcion'
+  attachInterrupt(digitalPinToInterrupt(intPin), miInterrupcion, RISING);
+}
+
+void loop() {
+  if (datosListos) {
+    datosListos = false;
+    // AQUÍ pones el código para leer el MPU6050 rápidamente
+    Serial.println("¡El sensor avisó que tiene datos nuevos!");
+  }
+}
+
+// Esta función se ejecuta inmediatamente cuando el pin INT se activa
+void miInterrupcion() {
+  datosListos = true; 
+}
